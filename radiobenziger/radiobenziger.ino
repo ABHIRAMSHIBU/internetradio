@@ -7,14 +7,19 @@
 // Include our custom modules
 #include "Config.h"
 #include "WiFiManager.h"
-#include "I2CScanner.h"
+#include "I2SDetector.h"
+#include "AudioStreamer.h"
 
 // Pin definitions
 #define LED_BUILTIN 2
-#define I2S_BCLK 26
-#define I2S_LRC 25
-#define I2S_DIN 22
-#define I2S_SD 21   // Optional shutdown pin for MAX98357A
+
+// I2S Audio pins (MAX98357A + Microphone)
+#define I2S_BCLK 25     // Bit Clock
+#define I2S_LRC 26      // Left/Right Clock (Word Select)
+#define I2S_DIN 27      // Data Input to DAC
+
+// Optional pins
+#define I2S_SD 19       // Optional shutdown pin for MAX98357A
 
 // Global objects
 WebServer server(80);
@@ -49,13 +54,39 @@ void setup() {
     // Print current configuration status
     Config::printStatus();
     
-    // Initialize I2C scanner
-    Serial.println("Initializing I2C scanner...");
-    if (I2CScanner::begin(21, 22)) {
-        Serial.println("I2C scanner initialized successfully");
-        I2CScanner::printScanResults();
+    // Initialize I2S detector with detailed diagnostics
+    Serial.println("Initializing I2S detector...");
+    Serial.println("Expected devices:");
+    Serial.println("  - MAX98357A I2S DAC (Audio Output)");
+    Serial.println("  - I2S Microphone (Audio Input)");
+    Serial.println("Testing I2S bus...");
+    
+    if (I2SDetector::begin()) {
+        Serial.println("I2S detector initialized successfully");
+        I2SDetector::printDetectionResults();
+        
+        // Additional diagnostic info
+        int deviceCount = I2SDetector::getDeviceCount();
+        if (deviceCount == 0) {
+            Serial.println("⚠️  NO I2S DEVICES RESPONDING!");
+            Serial.println("Possible issues:");
+            Serial.println("  1. Check wiring: BCLK->GPIO25, LRC->GPIO26, DIN->GPIO27");
+            Serial.println("  2. Check power supply to MAX98357A");
+            Serial.println("  3. Verify I2S device connections");
+            Serial.println("  4. Check if audio stream initialization works");
+        } else {
+            Serial.printf("✅ Found %d I2S device(s)\n", deviceCount);
+        }
     } else {
-        Serial.println("WARNING: I2C scanner initialization failed");
+        Serial.println("WARNING: I2S detector initialization failed");
+    }
+    
+    // Initialize audio streamer
+    Serial.println("Initializing audio streamer...");
+    if (AudioStreamer::begin()) {
+        Serial.println("Audio streamer initialized successfully");
+    } else {
+        Serial.println("WARNING: Audio streamer initialization failed");
     }
     
     // Initialize WiFi
@@ -121,6 +152,9 @@ void loop() {
     
     // Update WiFi manager
     WiFiManager::update();
+    
+    // Update audio streamer
+    AudioStreamer::update();
     
     // Handle LED status indication
     if (systemReady) {
@@ -196,6 +230,14 @@ void setupWebServer() {
     // Reset configuration
     server.on("/reset", HTTP_POST, handleReset);
     
+    // Audio control endpoints
+    server.on("/audio/play", HTTP_POST, handleAudioPlay);
+    server.on("/audio/stop", HTTP_POST, handleAudioStop);
+    server.on("/audio/pause", HTTP_POST, handleAudioPause);
+    server.on("/audio/resume", HTTP_POST, handleAudioResume);
+    server.on("/audio/volume", HTTP_POST, handleAudioVolume);
+    server.on("/audio/status", HTTP_GET, handleAudioStatus);
+    
     // 404 handler
     server.onNotFound(handleNotFound);
 }
@@ -232,10 +274,24 @@ void handleRoot() {
         html += "</div>";
     }
     
-    // Stream Status
+    // Audio Status
     html += "<div class='status'>";
+    html += "<strong>Audio Status:</strong> <span id='audioStatus'>" + AudioStreamer::getStatusString() + "</span><br>";
+    html += "<strong>Volume:</strong> <span id='volumeLevel'>" + String(AudioStreamer::getVolume()) + "</span>%<br>";
     html += "<strong>Stream URL:</strong><br>";
     html += Config::settings.streamURL;
+    html += "</div>";
+    
+    // Audio Controls
+    html += "<div style='text-align:center;margin:20px 0;padding:20px;background:#f8f9fa;border-radius:5px'>";
+    html += "<h3>🎵 Audio Controls</h3>";
+    html += "<button onclick='playAudio()' class='btn btn-primary'>▶ Play</button>";
+    html += "<button onclick='stopAudio()' class='btn btn-secondary'>⏹ Stop</button>";
+    html += "<button onclick='pauseAudio()' class='btn btn-secondary'>⏸ Pause</button>";
+    html += "<button onclick='resumeAudio()' class='btn btn-secondary'>▶ Resume</button><br><br>";
+    html += "<label>Volume: </label>";
+    html += "<input type='range' id='volumeSlider' min='0' max='100' value='" + String(AudioStreamer::getVolume()) + "' onchange='setVolume(this.value)'>";
+    html += "<span id='volumeDisplay'>" + String(AudioStreamer::getVolume()) + "%</span>";
     html += "</div>";
     
     // Navigation buttons
@@ -244,6 +300,44 @@ void handleRoot() {
     html += "<a href='/stream' class='btn btn-primary'>Stream Config</a>";
     html += "<a href='/info' class='btn btn-secondary'>System Info</a>";
     html += "</div>";
+    
+    // JavaScript for audio controls
+    html += "<script>";
+    html += "function playAudio() {";
+    html += "  fetch('/audio/play', {method: 'POST'})";
+    html += "    .then(response => response.json())";
+    html += "    .then(data => { updateStatus(); console.log(data); });";
+    html += "}";
+    html += "function stopAudio() {";
+    html += "  fetch('/audio/stop', {method: 'POST'})";
+    html += "    .then(response => response.json())";
+    html += "    .then(data => { updateStatus(); console.log(data); });";
+    html += "}";
+    html += "function pauseAudio() {";
+    html += "  fetch('/audio/pause', {method: 'POST'})";
+    html += "    .then(response => response.json())";
+    html += "    .then(data => { updateStatus(); console.log(data); });";
+    html += "}";
+    html += "function resumeAudio() {";
+    html += "  fetch('/audio/resume', {method: 'POST'})";
+    html += "    .then(response => response.json())";
+    html += "    .then(data => { updateStatus(); console.log(data); });";
+    html += "}";
+    html += "function setVolume(vol) {";
+    html += "  fetch('/audio/volume', {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: 'volume=' + vol})";
+    html += "    .then(response => response.json())";
+    html += "    .then(data => { document.getElementById('volumeDisplay').innerText = vol + '%'; });";
+    html += "}";
+    html += "function updateStatus() {";
+    html += "  fetch('/audio/status')";
+    html += "    .then(response => response.json())";
+    html += "    .then(data => {";
+    html += "      document.getElementById('audioStatus').innerText = data.data.state;";
+    html += "      document.getElementById('volumeLevel').innerText = data.data.volume;";
+    html += "    });";
+    html += "}";
+    html += "setInterval(updateStatus, 2000);"; // Update every 2 seconds
+    html += "</script>";
     
     html += "</div></body></html>";
     
@@ -423,6 +517,65 @@ void handleNotFound() {
         "<a href='/'>← Back to Home</a>");
 }
 
+// Audio control handlers
+void handleAudioPlay() {
+    String url = server.arg("url");
+    if (url.length() == 0) {
+        url = String(Config::settings.streamURL);
+    }
+    
+    if (AudioStreamer::connectToStream(url.c_str())) {
+        server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Stream started\"}");
+    } else {
+        server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"Failed to start stream\"}");
+    }
+}
+
+void handleAudioStop() {
+    AudioStreamer::stop();
+    server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Audio stopped\"}");
+}
+
+void handleAudioPause() {
+    AudioStreamer::pause();
+    server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Audio paused\"}");
+}
+
+void handleAudioResume() {
+    AudioStreamer::resume();
+    server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Audio resumed\"}");
+}
+
+void handleAudioVolume() {
+    String volumeStr = server.arg("volume");
+    if (volumeStr.length() > 0) {
+        uint8_t volume = volumeStr.toInt();
+        AudioStreamer::setVolume(volume);
+        server.send(200, "application/json", "{\"status\":\"success\",\"volume\":" + String(volume) + "}");
+    } else {
+        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"No volume provided\"}");
+    }
+}
+
+void handleAudioStatus() {
+    String json = "{";
+    json += "\"status\":\"success\",";
+    json += "\"data\":{";
+    json += "\"state\":\"" + AudioStreamer::getStatusString() + "\",";
+    json += "\"volume\":" + String(AudioStreamer::getVolume()) + ",";
+    json += "\"url\":\"" + AudioStreamer::getStreamURL() + "\",";
+    json += "\"buffer_level\":" + String(AudioStreamer::getBufferLevel()) + ",";
+    json += "\"bitrate\":" + String(AudioStreamer::getBitrate()) + ",";
+    json += "\"sample_rate\":" + String(AudioStreamer::getSampleRate());
+    if (AudioStreamer::hasMetadata()) {
+        json += ",\"title\":\"" + AudioStreamer::getCurrentTitle() + "\",";
+        json += "\"artist\":\"" + AudioStreamer::getCurrentArtist() + "\"";
+    }
+    json += "}}";
+    
+    server.send(200, "application/json", json);
+}
+
 void printStatus() {
     Serial.println("========== SYSTEM STATUS ==========");
     Serial.printf("Uptime: %lu seconds (%lu minutes)\n", millis() / 1000, millis() / 60000);
@@ -445,8 +598,27 @@ void printStatus() {
     Serial.printf("System Ready: %s\n", systemReady ? "Yes" : "No");
     Serial.printf("Web Server: %s\n", "Running");
     
-    // I2C Status
-    Serial.printf("I2C Devices Found: %d\n", I2CScanner::getDeviceCount());
+    // I2S Status
+    Serial.printf("I2S Devices Found: %d\n", I2SDetector::getDeviceCount());
+    
+    // Audio Status
+    Serial.printf("Audio State: %s\n", AudioStreamer::getStatusString().c_str());
+    Serial.printf("Audio Volume: %d%%\n", AudioStreamer::getVolume());
+    if (AudioStreamer::isPlaying()) {
+        Serial.printf("Stream URL: %s\n", AudioStreamer::getStreamURL().c_str());
+        Serial.printf("Buffer Level: %d%%\n", AudioStreamer::getBufferLevel());
+        if (AudioStreamer::getBitrate() > 0) {
+            Serial.printf("Bitrate: %d kbps\n", AudioStreamer::getBitrate());
+        }
+        if (AudioStreamer::getSampleRate() > 0) {
+            Serial.printf("Sample Rate: %d Hz\n", AudioStreamer::getSampleRate());
+        }
+        if (AudioStreamer::hasMetadata()) {
+            Serial.printf("Now Playing: %s - %s\n", 
+                         AudioStreamer::getCurrentArtist().c_str(),
+                         AudioStreamer::getCurrentTitle().c_str());
+        }
+    }
     
     Serial.println("===================================");
 }
