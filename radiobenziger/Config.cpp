@@ -5,7 +5,7 @@ Config::Settings Config::settings;
 Preferences Config::prefs;
 bool Config::initialized = false;
 
-const char* Config::DEFAULT_STREAM_URL = "http://192.168.1.189:8080/benziger";  // Changed to HTTP (or use your proxy URL)
+const char* Config::DEFAULT_STREAM_URL = "https://icecast.octosignals.com/benziger";  // Changed to HTTP (or use your proxy URL)
 const char* Config::DEFAULT_DEVICE_NAME = "Radio Benziger";
 const int Config::EEPROM_SIZE = 512;
 const int Config::EEPROM_CONFIG_ADDR = 0;
