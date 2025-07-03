@@ -1,6 +1,16 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
+#include <NetworkClientSecure.h>
+#include <Preferences.h>
+#include <EEPROM.h>
+#include <vector>
+#include <cmath>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+
 #include "Config.h"
 #include "WiFiManager.h"
 #include "PCMStreamer.h"
@@ -9,275 +19,390 @@
 Config config;
 WiFiManager wifiManager;
 WebServer server(80);
-HTTPClient httpClient;
-WiFiClient wifiClient;
-
-// Audio objects
 PCMStreamer* audioStreamer = nullptr;
-bool audioInitialized = false;
-bool audioPlaying = false;
-
-// Continuous audio control
-TaskHandle_t audioTaskHandle = nullptr;
-float currentToneFrequency = 0.0f;
-bool continuousAudio = false;
-SemaphoreHandle_t audioMutex = nullptr;
-
-// Audio generation parameters
-const size_t AUDIO_BUFFER_QUEUE_SIZE = 4;      // Reduced queue size to save memory
-const size_t AUDIO_CHUNK_SAMPLES = 800;        // Smaller chunks (0.025 seconds at 32kHz)
-const size_t AUDIO_CHUNK_DURATION_MS = 25;     // 25ms per chunk
-
-// Audio buffer structure with fixed-size array (safer for FreeRTOS queues)
-struct AudioBuffer {
-    int16_t samples[AUDIO_CHUNK_SAMPLES * 2]; // Fixed size: stereo samples
-    size_t sampleCount;
-    float frequency;
-    bool isValid;
-    
-    AudioBuffer() : sampleCount(0), frequency(0.0f), isValid(false) {
-        memset(samples, 0, sizeof(samples));
-    }
-    
-    AudioBuffer(const std::vector<int16_t>& data, float freq) : 
-        sampleCount(data.size()), frequency(freq), isValid(true) {
-        memset(samples, 0, sizeof(samples));
-        if (data.size() <= sizeof(samples)/sizeof(samples[0])) {
-            memcpy(samples, data.data(), data.size() * sizeof(int16_t));
-        }
-    }
-};
-
-// Asynchronous audio generation
-TaskHandle_t audioGeneratorTaskHandle = nullptr;
-QueueHandle_t audioBufferQueue = nullptr;
-SemaphoreHandle_t audioGeneratorMutex = nullptr;
-
-// Audio generator state
-volatile bool audioGeneratorRunning = false;
-volatile float targetFrequency = 0.0f;
-volatile bool frequencyChanged = false;
 
 // Connection state
 bool isConnected = false;
+bool audioInitialized = false;
 
-// Audio test data with continuity
-std::vector<int16_t> generateTestTone(float frequency, float duration, uint32_t sampleRate, uint8_t channels) {
-    // Static variables to maintain state between calls
-    static float lastFrequency = 0.0f;
-    static double phaseAccumulator = 0.0;
-    static uint32_t lastSampleRate = 0;
+// Audio streaming parameters - Optimized for WiFi resilience
+const size_t AUDIO_BUFFER_QUEUE_SIZE = 20;     // Large buffer for WiFi interruptions (1 second total)
+const size_t AUDIO_CHUNK_SAMPLES = 1600;       // Larger chunks (50ms at 32kHz)
+const size_t AUDIO_CHUNK_DURATION_MS = 50;     // 50ms per chunk
+const size_t HTTP_BUFFER_SIZE = 6400;          // Larger HTTP buffer (4x chunk size)
+
+// PCM streaming configuration
+const char* PCM_SERVER_HOST = "192.168.1.189"; // Update with your server IP (find with: ip addr show)
+const int PCM_SERVER_PORT = 8080;
+const char* PCM_STREAM_PATH = "/stream";
+
+// Audio buffer structure with fixed-size array (safer for FreeRTOS queues)
+struct AudioBuffer {
+    int16_t samples[AUDIO_CHUNK_SAMPLES]; // Fixed size: mono samples from server
+    size_t sampleCount;
+    bool isValid;
+    bool isSilence;
     
-    // Reset phase if frequency or sample rate changed
-    if (frequency != lastFrequency || sampleRate != lastSampleRate) {
-        phaseAccumulator = 0.0;
-        lastFrequency = frequency;
-        lastSampleRate = sampleRate;
-        Serial.printf("Phase reset for frequency: %.1f Hz\n", frequency);
+    AudioBuffer() : sampleCount(0), isValid(false), isSilence(true) {
+        memset(samples, 0, sizeof(samples));
     }
     
-    size_t sampleCount = (size_t)(duration * sampleRate);
-    std::vector<int16_t> samples;
-    samples.reserve(sampleCount * channels);
-    
-    // Calculate phase increment per sample
-    double phaseIncrement = (2.0 * M_PI * frequency) / sampleRate;
-    
-    for (size_t i = 0; i < sampleCount; i++) {
-        float amplitude = 0.2f; // 20% volume to avoid clipping
-        int16_t sample = (int16_t)(amplitude * 32767.0f * sin(phaseAccumulator));
-        
-        // Add sample for each channel
-        for (uint8_t ch = 0; ch < channels; ch++) {
-            samples.push_back(sample);
-        }
-        
-        // Advance phase accumulator
-        phaseAccumulator += phaseIncrement;
-        
-        // Keep phase accumulator in reasonable range to prevent precision loss
-        if (phaseAccumulator >= 2.0 * M_PI) {
-            phaseAccumulator -= 2.0 * M_PI;
+    AudioBuffer(const int16_t* data, size_t count) : 
+        sampleCount(count), isValid(true), isSilence(false) {
+        memset(samples, 0, sizeof(samples));
+        if (count <= sizeof(samples)/sizeof(samples[0])) {
+            memcpy(samples, data, count * sizeof(int16_t));
         }
     }
     
-    return samples;
-}
-
-// Generate white noise samples
-std::vector<int16_t> generateWhiteNoise(float duration, uint32_t sampleRate, uint8_t channels) {
-    size_t sampleCount = (size_t)(duration * sampleRate);
-    std::vector<int16_t> samples;
-    samples.reserve(sampleCount * channels);
-    
-    for (size_t i = 0; i < sampleCount; i++) {
-        int16_t sample = (int16_t)(0.1f * 32767.0f * ((float)random(-1000, 1000) / 1000.0f));
-        
-        // Add sample for each channel
-        for (uint8_t ch = 0; ch < channels; ch++) {
-            samples.push_back(sample);
-        }
+    // Create silence buffer
+    static AudioBuffer createSilence() {
+        AudioBuffer buffer;
+        buffer.sampleCount = AUDIO_CHUNK_SAMPLES;
+        buffer.isValid = true;
+        buffer.isSilence = true;
+        memset(buffer.samples, 0, sizeof(buffer.samples));
+        return buffer;
     }
-    
-    return samples;
-}
+};
 
-// Reset tone generator phase (call when changing frequency or stopping/starting)
-void resetToneGenerator() {
-    // This will force generateTestTone to reset its phase on next call
-    generateTestTone(0.0f, 0.0f, 0, 0);
-}
+// Streaming control variables
+bool streamingActive = false;
+bool streamingRequested = false;
+SemaphoreHandle_t streamingMutex = nullptr;
 
-// Asynchronous audio generator task (runs on Core 0)
-void audioGeneratorTask(void* parameter) {
-    Serial.println("Audio generator task started on Core 0");
-    
-    while (true) {
-        if (audioGeneratorRunning) {
-            std::vector<int16_t> samples;
-            float chunkDuration = (float)AUDIO_CHUNK_SAMPLES / 32000.0f; // Duration in seconds
-            
-            if (targetFrequency > 0.0f) {
-                // Generate tone
-                if (frequencyChanged) {
-                    Serial.printf("Frequency changed to %.1f Hz\n", targetFrequency);
-                    resetToneGenerator();
-                    frequencyChanged = false;
-                }
-                samples = generateTestTone(targetFrequency, chunkDuration, 32000, 2);
-            } else if (targetFrequency < 0.0f) {
-                // Generate white noise
-                samples = generateWhiteNoise(chunkDuration, 32000, 2);
-            } else {
-                // targetFrequency == 0, no audio generation
-                vTaskDelay(pdMS_TO_TICKS(100));
-                continue;
-            }
-            
-            // Create audio buffer
-            AudioBuffer buffer(samples, targetFrequency);
-            
-            // Try to send to queue (non-blocking)
-            if (audioBufferQueue != nullptr) {
-                if (xQueueSend(audioBufferQueue, &buffer, 0) != pdTRUE) {
-                    // Queue full, skip this buffer (this prevents blocking)
-                    Serial.println("Audio buffer queue full, skipping buffer");
-                }
-            }
-        } else {
-            // No audio generation needed, wait longer
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        // Adaptive delay based on queue status
-        UBaseType_t queueCount = uxQueueMessagesWaiting(audioBufferQueue);
-        if (queueCount >= AUDIO_BUFFER_QUEUE_SIZE - 1) {
-            // Queue almost full, wait longer
-            vTaskDelay(pdMS_TO_TICKS(AUDIO_CHUNK_DURATION_MS));
-        } else {
-            // Queue has space, generate at normal rate
-            vTaskDelay(pdMS_TO_TICKS(AUDIO_CHUNK_DURATION_MS / 2));
-        }
-    }
-}
+// Task handles
+TaskHandle_t audioTaskHandle = nullptr;
+TaskHandle_t streamingTaskHandle = nullptr;
+QueueHandle_t audioBufferQueue = nullptr;
 
 // Audio playback task (runs on Core 1) - consumes from buffer queue
 void audioTask(void* parameter) {
     Serial.println("Audio playback task started on Core 1");
     
-    // Static buffer to avoid stack allocation
+    // Static vector for reuse (prevents stack overflow)
     static std::vector<int16_t> sampleVector;
-    sampleVector.reserve(AUDIO_CHUNK_SAMPLES * 2); // Reserve space once
+    sampleVector.reserve(AUDIO_CHUNK_SAMPLES);
+    
+    // Silence detection
+    uint32_t silenceCount = 0;
+    const uint32_t MAX_SILENCE_BEFORE_MUTE = 4; // 4 buffers (200ms) of silence before muting
     
     while (true) {
-        if (continuousAudio && audioInitialized && audioStreamer && audioStreamer->isReady()) {
+        bool audioWritten = false;
+        
+        if (audioInitialized && audioStreamer && audioStreamer->isReady()) {
             // Try to get audio buffer from queue
             AudioBuffer buffer;
-            if (audioBufferQueue != nullptr && xQueueReceive(audioBufferQueue, &buffer, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (audioBufferQueue != nullptr && xQueueReceive(audioBufferQueue, &buffer, pdMS_TO_TICKS(50)) == pdTRUE) {
                 if (buffer.isValid && buffer.sampleCount > 0) {
-                    // Reuse static vector to avoid stack allocation
-                    sampleVector.clear();
-                    sampleVector.assign(buffer.samples, buffer.samples + buffer.sampleCount);
-                    
-                    // Write buffered audio to streamer
-                    size_t bytesWritten = audioStreamer->writeSamples(sampleVector);
-                    if (bytesWritten == 0) {
-                        Serial.println("Warning: Audio write failed");
+                    // Check if this is silence or valid audio
+                    if (buffer.isSilence || !streamingActive) {
+                        silenceCount++;
+                        // Only output silence if we haven't been silent too long
+                        if (silenceCount <= MAX_SILENCE_BEFORE_MUTE) {
+                            sampleVector.clear();
+                            sampleVector.assign(buffer.samples, buffer.samples + buffer.sampleCount);
+                            audioStreamer->writeSamples(sampleVector);
+                            audioWritten = true;
+                        }
                     } else {
-                        // Successfully played buffer
-                        static uint32_t bufferCount = 0;
-                        bufferCount++;
-                        if (bufferCount % 20 == 0) { // Print every second (20 * 50ms)
-                            Serial.printf("Played %u audio buffers (%.1f Hz)\n", bufferCount, buffer.frequency);
+                        // Valid audio data
+                        silenceCount = 0;
+                        sampleVector.clear();
+                        sampleVector.assign(buffer.samples, buffer.samples + buffer.sampleCount);
+                        
+                        size_t bytesWritten = audioStreamer->writeSamples(sampleVector);
+                        if (bytesWritten > 0) {
+                            audioWritten = true;
+                            // Successfully played buffer
+                            static uint32_t bufferCount = 0;
+                            bufferCount++;
+                            if (bufferCount % 20 == 0) { // Print every second (20 * 50ms)
+                                UBaseType_t queueCount = uxQueueMessagesWaiting(audioBufferQueue);
+                                Serial.printf("Played %u buffers, queue: %u/%u (streaming: %s)\n", 
+                                            bufferCount, queueCount, AUDIO_BUFFER_QUEUE_SIZE, streamingActive ? "yes" : "no");
+                            }
+                        } else {
+                            Serial.println("Warning: Audio write failed");
                         }
                     }
                 }
             } else {
-                // No buffer available - this is normal when no audio is playing
-                // The generator task handles all audio generation including white noise
+                // No buffer available - only send silence if we're actively streaming and queue is empty
+                if (streamingActive && streamingRequested) {
+                    UBaseType_t queueCount = uxQueueMessagesWaiting(audioBufferQueue);
+                    if (queueCount == 0) {
+                        // Only send silence if queue is truly empty
+                        AudioBuffer silenceBuffer = AudioBuffer::createSilence();
+                        sampleVector.clear();
+                        sampleVector.assign(silenceBuffer.samples, silenceBuffer.samples + silenceBuffer.sampleCount);
+                        audioStreamer->writeSamples(sampleVector);
+                        audioWritten = true;
+                        silenceCount++;
+                        
+                        static uint32_t underrunCount = 0;
+                        underrunCount++;
+                        if (underrunCount % 10 == 0) {
+                            Serial.printf("Buffer underrun: %u occurrences\n", underrunCount);
+                        }
+                    }
+                }
             }
-        } else {
-            // Audio not active, wait longer
-            vTaskDelay(pdMS_TO_TICKS(100));
         }
         
-        // Small delay for audio timing
-        vTaskDelay(pdMS_TO_TICKS(25)); // 25ms delay for smooth playback
+        // If no audio was written and streaming is active, ensure we maintain timing
+        if (!audioWritten && streamingActive) {
+            vTaskDelay(pdMS_TO_TICKS(AUDIO_CHUNK_DURATION_MS));
+        } else if (!streamingActive) {
+            // When not streaming, wait longer and ensure audio is stopped
+            if (audioStreamer && audioStreamer->isReady()) {
+                audioStreamer->clearBuffers();
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            // Small delay for timing
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
     }
 }
 
-// Start continuous tone with async generation
-void startContinuousTone(float frequency) {
-    // Update target frequency for async generator
-    if (targetFrequency != frequency) {
-        targetFrequency = frequency;
-        frequencyChanged = true;
-    }
+// PCM streaming task (runs on Core 0) - fetches data from server
+void streamingTask(void* parameter) {
+    Serial.println("PCM streaming task started on Core 0");
     
-    // Start async audio generation
-    audioGeneratorRunning = true;
+    HTTPClient http;
+    WiFiClient client;
     
-    // Start audio playback
-    if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
-        currentToneFrequency = frequency;
-        continuousAudio = true;
-        audioPlaying = true;
-        Serial.printf("Started continuous tone: %.1f Hz (async mode)\n", frequency);
-        xSemaphoreGive(audioMutex);
+    while (true) {
+        if (streamingRequested && WiFi.status() == WL_CONNECTED) {
+            Serial.println("Starting PCM stream connection...");
+            
+            // Configure HTTP client with better settings for streaming
+            String url = String("http://") + PCM_SERVER_HOST + ":" + PCM_SERVER_PORT + PCM_STREAM_PATH;
+            http.begin(client, url);
+            http.setTimeout(30000); // 30 second timeout for streaming
+            http.addHeader("User-Agent", "ESP32-RadioBenziger/1.0");
+            http.addHeader("Connection", "keep-alive");
+            http.addHeader("Cache-Control", "no-cache");
+            
+            // Start HTTP request
+            int httpResponseCode = http.GET();
+            
+            if (httpResponseCode == 200) {
+                Serial.println("✅ Connected to PCM stream");
+                
+                // Get stream
+                WiFiClient* stream = http.getStreamPtr();
+                if (stream) {
+                    Serial.println("Pre-buffering audio data...");
+                    
+                    // Pre-buffer some data before starting audio playback
+                    int preBufferCount = 0;
+                    static uint8_t preBuffer[HTTP_BUFFER_SIZE];  // Static to save stack space
+                    int16_t* preBufferPCM = (int16_t*)preBuffer;
+                    
+                    while (preBufferCount < 8 && streamingRequested && stream->connected()) {
+                        int bytesRead = stream->readBytes(preBuffer, HTTP_BUFFER_SIZE);
+                        if (bytesRead > 0) {
+                            size_t sampleCount = bytesRead / sizeof(int16_t);
+                            size_t offset = 0;
+                            
+                            while (offset < sampleCount && preBufferCount < 8) {
+                                size_t chunkSize = (sampleCount - offset) > AUDIO_CHUNK_SAMPLES ? 
+                                                  AUDIO_CHUNK_SAMPLES : (sampleCount - offset);
+                                
+                                AudioBuffer buffer;
+                                buffer.sampleCount = chunkSize;
+                                buffer.isValid = true;
+                                buffer.isSilence = false;
+                                memcpy(buffer.samples, &preBufferPCM[offset], chunkSize * sizeof(int16_t));
+                                
+                                if (audioBufferQueue != nullptr) {
+                                    xQueueSend(audioBufferQueue, &buffer, pdMS_TO_TICKS(100));
+                                    preBufferCount++;
+                                }
+                                
+                                offset += chunkSize;
+                            }
+                        } else {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                        }
+                    }
+                    
+                    Serial.printf("Pre-buffered %d audio buffers\n", preBufferCount);
+                    
+                    // Wait for queue to fill up before starting audio playback
+                    Serial.println("Waiting for queue to fill before starting audio...");
+                    int waitCycles = 0;
+                    while (waitCycles < 50 && streamingRequested) { // Max 5 seconds wait
+                        UBaseType_t queueCount = uxQueueMessagesWaiting(audioBufferQueue);
+                        Serial.printf("Queue fill status: %u/20 buffers\n", queueCount);
+                        
+                        if (queueCount >= 15) {
+                            Serial.printf("✅ Queue sufficiently filled (%u/20), starting audio playback\n", queueCount);
+                            break;
+                        }
+                        
+                        vTaskDelay(pdMS_TO_TICKS(100)); // Wait 100ms between checks
+                        waitCycles++;
+                    }
+                    
+                    streamingActive = true;
+                    Serial.println("🎵 Audio playback started!");
+                    
+                    // Buffer for reading HTTP data (static to save stack space)
+                    static uint8_t httpBuffer[HTTP_BUFFER_SIZE];
+                    int16_t* pcmBuffer = (int16_t*)httpBuffer;
+                    
+                    while (streamingRequested && stream->connected()) {
+                        // Read PCM data from HTTP stream - read multiple chunks to fill queue
+                        while (streamingRequested && stream->connected()) {
+                            int bytesRead = stream->readBytes(httpBuffer, HTTP_BUFFER_SIZE);
+                            
+                            if (bytesRead > 0) {
+                                // Convert bytes to sample count (16-bit samples)
+                                size_t sampleCount = bytesRead / sizeof(int16_t);
+                                
+                                // Process data in chunks that match our buffer size
+                                size_t offset = 0;
+                                while (offset < sampleCount && streamingRequested) {
+                                    size_t chunkSize = (sampleCount - offset) > AUDIO_CHUNK_SAMPLES ? 
+                                                      AUDIO_CHUNK_SAMPLES : (sampleCount - offset);
+                                    
+                                    // Create buffer for this chunk
+                                    AudioBuffer buffer;
+                                    buffer.sampleCount = chunkSize;
+                                    buffer.isValid = true;
+                                    buffer.isSilence = false;
+                                    
+                                    // Copy chunk data
+                                    memcpy(buffer.samples, &pcmBuffer[offset], chunkSize * sizeof(int16_t));
+                                    
+                                    // Send to audio playback queue
+                                    if (audioBufferQueue != nullptr) {
+                                        // Check queue space
+                                        UBaseType_t queueSpace = uxQueueSpacesAvailable(audioBufferQueue);
+                                        
+                                        if (queueSpace == 0) {
+                                            // Queue full, remove oldest buffer and add new one
+                                            AudioBuffer oldBuffer;
+                                            xQueueReceive(audioBufferQueue, &oldBuffer, 0);
+                                            static uint32_t dropCount = 0;
+                                            dropCount++;
+                                            if (dropCount % 20 == 0) {
+                                                Serial.printf("Buffer overflow: dropped %u buffers\n", dropCount);
+                                            }
+                                        }
+                                        
+                                        // Add new buffer
+                                        if (xQueueSend(audioBufferQueue, &buffer, pdMS_TO_TICKS(10)) != pdTRUE) {
+                                            Serial.println("Failed to queue audio buffer");
+                                        }
+                                    }
+                                    
+                                    offset += chunkSize;
+                                }
+                                
+                                // Check if we should fill the queue more aggressively
+                                UBaseType_t queueCount = uxQueueMessagesWaiting(audioBufferQueue);
+                                if (queueCount < 2) {
+                                    // Queue is low, continue reading without delay
+                                    continue;
+                                } else if (queueCount >= 6) {
+                                    // Queue is getting full, slow down
+                                    vTaskDelay(pdMS_TO_TICKS(20));
+                                    break;
+                                } else {
+                                    // Normal level, small delay
+                                    vTaskDelay(pdMS_TO_TICKS(5));
+                                    break;
+                                }
+                            } else {
+                                // No data available, wait a bit
+                                vTaskDelay(pdMS_TO_TICKS(10));
+                                break;
+                            }
+                        }
+                    }
+                    
+                    streamingActive = false;
+                    Serial.println("PCM stream disconnected");
+                }
+            } else {
+                Serial.printf("❌ HTTP request failed: %d\n", httpResponseCode);
+                
+                // Send silence buffers when connection fails to prevent noise
+                for (int i = 0; i < 5; i++) {
+                    if (!streamingRequested) break;
+                    
+                    AudioBuffer silenceBuffer = AudioBuffer::createSilence();
+                    if (audioBufferQueue != nullptr) {
+                        xQueueSend(audioBufferQueue, &silenceBuffer, 0);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(AUDIO_CHUNK_DURATION_MS));
+                }
+                
+                vTaskDelay(pdMS_TO_TICKS(3000)); // Wait 3 seconds before retry
+            }
+            
+            http.end();
+        } else {
+            // Not streaming, wait longer
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        
+        // Small delay between connection attempts
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-// Stop continuous audio and async generation
-void stopContinuousAudio() {
-    // Stop async audio generation
-    audioGeneratorRunning = false;
-    targetFrequency = 0.0f;
-    
-    // Clear audio buffer queue
-    if (audioBufferQueue != nullptr) {
-        AudioBuffer buffer;
-        while (xQueueReceive(audioBufferQueue, &buffer, 0) == pdTRUE) {
-            // Clear all queued buffers
+// Start PCM streaming
+void startPCMStreaming() {
+    if (xSemaphoreTake(streamingMutex, portMAX_DELAY) == pdTRUE) {
+        if (!streamingRequested) {
+            streamingRequested = true;
+            Serial.println("PCM streaming requested");
+            
+            // Clear audio buffer queue
+            if (audioBufferQueue != nullptr) {
+                AudioBuffer buffer;
+                while (xQueueReceive(audioBufferQueue, &buffer, 0) == pdTRUE) {
+                    // Clear all queued buffers
+                }
+            }
         }
+        xSemaphoreGive(streamingMutex);
     }
-    
-    // Stop audio playback
-    if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
-        continuousAudio = false;
-        audioPlaying = false;
-        currentToneFrequency = 0.0f;
-        resetToneGenerator(); // Reset phase when stopping
-        if (audioStreamer) {
-            audioStreamer->clearBuffers();
+}
+
+// Stop PCM streaming
+void stopPCMStreaming() {
+    if (xSemaphoreTake(streamingMutex, portMAX_DELAY) == pdTRUE) {
+        if (streamingRequested) {
+            streamingRequested = false;
+            streamingActive = false;
+            Serial.println("PCM streaming stopped");
+            
+            // Clear audio buffer queue
+            if (audioBufferQueue != nullptr) {
+                AudioBuffer buffer;
+                while (xQueueReceive(audioBufferQueue, &buffer, 0) == pdTRUE) {
+                    // Clear all queued buffers
+                }
+            }
+            
+            if (audioStreamer) {
+                audioStreamer->clearBuffers();
+            }
         }
-        Serial.println("Stopped continuous audio (async mode)");
-        xSemaphoreGive(audioMutex);
+        xSemaphoreGive(streamingMutex);
     }
 }
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("Radio Benziger Audio Test System");
+    Serial.println("Radio Benziger PCM Streaming System");
     
     // Initialize configuration
     config.begin();
@@ -316,10 +441,10 @@ void setup() {
     // Initialize audio system
     Serial.println("Initializing audio system...");
     
-    // Create mutex for audio control
-    audioMutex = xSemaphoreCreateMutex();
-    if (audioMutex == nullptr) {
-        Serial.println("❌ Failed to create audio mutex");
+    // Create mutex for streaming control
+    streamingMutex = xSemaphoreCreateMutex();
+    if (streamingMutex == nullptr) {
+        Serial.println("❌ Failed to create streaming mutex");
         return;
     }
     
@@ -330,23 +455,16 @@ void setup() {
         return;
     }
     
-    // Create mutex for audio generator
-    audioGeneratorMutex = xSemaphoreCreateMutex();
-    if (audioGeneratorMutex == nullptr) {
-        Serial.println("❌ Failed to create audio generator mutex");
-        return;
-    }
-    
-    // Create audio config with safer buffer settings
+    // Create audio config with safe buffer settings
     PCMStreamer::AudioConfig audioConfig;
     audioConfig.sampleRate = 32000;
     audioConfig.bitsPerSample = 16;
-    audioConfig.channels = 2;
-    audioConfig.bufferSize = 512;    // Smaller buffer to avoid memory issues
-    audioConfig.bufferCount = 4;     // Fewer buffers
+    audioConfig.channels = 1;        // Mono audio for single speaker
+    audioConfig.bufferSize = 1024;   // Larger buffer for stability
+    audioConfig.bufferCount = 8;     // More buffers for smoother playback
     audioConfig.useAPLL = false;
     
-    PCMStreamer::PinConfig pinConfig; // Uses default pins we already updated
+    PCMStreamer::PinConfig pinConfig; // Uses default pins (BCLK=25, LRCK=26, DIN=27)
     
     audioStreamer = new PCMStreamer(audioConfig, pinConfig, I2S_NUM_0);
     
@@ -355,315 +473,145 @@ void setup() {
         Serial.println("✅ Audio system initialized successfully");
         audioStreamer->printDiagnostics();
         
-        // Create audio playback task (Core 1)
+        // Create audio playback task (Core 0) - can handle more congestion
         BaseType_t result = xTaskCreatePinnedToCore(
             audioTask,          // Task function
             "AudioPlayback",    // Task name
-            8192,              // Increased stack size for vector operations
+            12288,             // Increased stack size for Core 0 (was 8192)
             nullptr,           // Parameters
             2,                 // Priority (higher than default)
             &audioTaskHandle,  // Task handle
-            1                  // Core 1 (opposite of main task)
+            0                  // Core 0 (more congested, but audio is more resilient)
         );
         
         if (result == pdPASS) {
-            Serial.println("✅ Audio playback task created successfully");
+            Serial.println("✅ Audio playback task created successfully on Core 0 (12KB stack)");
         } else {
             Serial.println("❌ Failed to create audio playback task");
         }
         
-        // Create async audio generator task (Core 0)
-        BaseType_t generatorResult = xTaskCreatePinnedToCore(
-            audioGeneratorTask,         // Task function
-            "AudioGenerator",           // Task name
-            6144,                      // Reduced stack size
-            nullptr,                   // Parameters
-            1,                         // Lower priority than playback
-            &audioGeneratorTaskHandle, // Task handle
-            0                          // Core 0 (same as main task)
+        // Create PCM streaming task (Core 1) - prioritize HTTP streaming
+        BaseType_t streamingResult = xTaskCreatePinnedToCore(
+            streamingTask,         // Task function
+            "PCMStreaming",        // Task name
+            16384,                // Increased stack size for HTTP + pre-buffering
+            nullptr,              // Parameters
+            3,                    // Higher priority than audio for HTTP streaming
+            &streamingTaskHandle, // Task handle
+            1                     // Core 1 (less congested, prioritize HTTP)
         );
         
-        if (generatorResult == pdPASS) {
-            Serial.println("✅ Audio generator task created successfully");
+        if (streamingResult == pdPASS) {
+            Serial.println("✅ PCM streaming task created successfully on Core 1 (prioritized)");
         } else {
-            Serial.println("❌ Failed to create audio generator task");
+            Serial.println("❌ Failed to create PCM streaming task");
         }
     } else {
         Serial.println("❌ Failed to initialize audio system");
-        delete audioStreamer;
-        audioStreamer = nullptr;
     }
     
     // Setup web server routes
-    setupWebServer();
-    
-    // Start web server
-    server.begin();
-    Serial.println("Web server started");
-    
-    // Print final status
-    Serial.println("=== System Status ===");
-    Serial.printf("WiFi: %s\n", isConnected ? "Connected" : "AP Mode");
-    Serial.printf("Audio: %s\n", audioInitialized ? "Ready" : "Failed");
-    if (isConnected) {
-        Serial.printf("Web Interface: http://%s\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println("Web Interface: http://192.168.4.1");
-    }
-    Serial.println("=====================");
-}
-
-void loop() {
-    // Handle web server
-    server.handleClient();
-    
-    // Print IP address periodically when connected
-    static unsigned long lastIPPrint = 0;
-    if (isConnected && millis() - lastIPPrint > 5000) {
-        Serial.printf("IP: %s | Audio: %s\n", 
-                     WiFi.localIP().toString().c_str(),
-                     audioInitialized ? (audioPlaying ? "Playing" : "Ready") : "Failed");
-        lastIPPrint = millis();
-    }
-    
-    // Print system status periodically
-    static unsigned long lastStatusPrint = 0;
-    if (millis() - lastStatusPrint > 30000) {
-        printSystemStatus();
-        lastStatusPrint = millis();
-    }
-    
-    // Check WiFi connection
-    if (isConnected && WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi disconnected, attempting reconnection...");
-        isConnected = false;
-        WiFiManager::connectToWiFi(config.settings.wifiSSID, config.settings.wifiPassword);
-    }
-    
-    delay(100);
-}
-
-void setupWebServer() {
-    // Home page with audio controls
     server.on("/", HTTP_GET, []() {
-        String html = "<!DOCTYPE html><html><head><title>Radio Benziger Audio Test</title>";
+        String html = "<!DOCTYPE html><html><head>";
+        html += "<title>Radio Benziger PCM Streaming</title>";
         html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-        html += "<style>body{font-family:Arial;margin:40px;} .btn{padding:10px 20px;margin:5px;border:none;border-radius:5px;cursor:pointer;} .btn-primary{background:#007bff;color:white;} .btn-success{background:#28a745;color:white;} .btn-danger{background:#dc3545;color:white;} .status{padding:10px;margin:10px 0;border-radius:5px;} .status-ok{background:#d4edda;border:1px solid #c3e6cb;} .status-error{background:#f8d7da;border:1px solid #f5c6cb;}</style>";
-        html += "</head><body>";
-        html += "<h1>🎵 Radio Benziger Audio Test</h1>";
+        html += "<style>";
+        html += "body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }";
+        html += ".container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }";
+        html += "h1 { color: #333; text-align: center; }";
+        html += ".status { padding: 10px; margin: 10px 0; border-radius: 5px; }";
+        html += ".connected { background: #d4edda; color: #155724; }";
+        html += ".disconnected { background: #f8d7da; color: #721c24; }";
+        html += ".controls { text-align: center; margin: 20px 0; }";
+        html += "button { padding: 10px 20px; margin: 5px; font-size: 16px; border: none; border-radius: 5px; cursor: pointer; }";
+        html += ".start { background: #28a745; color: white; }";
+        html += ".stop { background: #dc3545; color: white; }";
+        html += ".info { background: #17a2b8; color: white; }";
+        html += ".settings { margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; }";
+        html += "</style></head><body>";
+        html += "<div class='container'>";
+        html += "<h1>Radio Benziger PCM Streaming</h1>";
         
-        // System status
-        html += "<div class='status " + String(audioInitialized ? "status-ok" : "status-error") + "'>";
-        html += "<strong>Audio System:</strong> " + String(audioInitialized ? "✅ Ready" : "❌ Failed") + "<br>";
-        html += "<strong>WiFi:</strong> " + String(isConnected ? "✅ Connected" : "📶 AP Mode") + "<br>";
-        if (isConnected) {
-            html += "<strong>IP:</strong> " + WiFi.localIP().toString() + "<br>";
-        }
-        html += "<strong>Free Memory:</strong> " + String(ESP.getFreeHeap()) + " bytes";
+        html += "<div class='status " + String(isConnected ? "connected" : "disconnected") + "'>";
+        html += "WiFi: " + String(isConnected ? "Connected" : "Disconnected");
         html += "</div>";
         
-        // Audio controls
-        if (audioInitialized) {
-            html += "<h2>Audio Test Controls</h2>";
-            html += "<button class='btn btn-primary' onclick='playTone(440)'>Play A4 (440Hz)</button>";
-            html += "<button class='btn btn-primary' onclick='playTone(880)'>Play A5 (880Hz)</button>";
-            html += "<button class='btn btn-primary' onclick='playTone(1320)'>Play E6 (1320Hz)</button>";
-            html += "<button class='btn btn-success' onclick='playWhiteNoise()'>White Noise</button>";
-            html += "<button class='btn btn-danger' onclick='stopAudio()'>Stop Audio</button>";
-            html += "<br><br>";
-            html += "<button class='btn btn-primary' onclick='audioStatus()'>Audio Status</button>";
-            html += "<button class='btn btn-primary' onclick='audioDiagnostics()'>Diagnostics</button>";
-        }
+        html += "<div class='status " + String(streamingActive ? "connected" : "disconnected") + "'>";
+        html += "PCM Stream: " + String(streamingActive ? "Active" : "Inactive");
+        html += "</div>";
         
-        // Navigation
-        html += "<h2>Configuration</h2>";
-        html += "<a href='/config' class='btn btn-primary'>WiFi Config</a>";
-        html += "<a href='/info' class='btn btn-primary'>System Info</a>";
+        html += "<div class='controls'>";
+        html += "<button class='start' onclick='startStream()'>Start Stream</button>";
+        html += "<button class='stop' onclick='stopStream()'>Stop Stream</button>";
+        html += "<button class='info' onclick='getStatus()'>Status</button>";
+        html += "</div>";
         
-        // JavaScript for audio controls
+        html += "<div class='settings'>";
+        html += "<h3>Stream Settings</h3>";
+        html += "<p><strong>Server:</strong> " + String(PCM_SERVER_HOST) + ":" + String(PCM_SERVER_PORT) + "</p>";
+        html += "<p><strong>Format:</strong> 32kHz, 16-bit, Mono to Stereo</p>";
+        html += "<p><strong>Buffer:</strong> " + String(AUDIO_CHUNK_SAMPLES) + " samples (25ms)</p>";
+        html += "<p><strong>Queue:</strong> " + String(AUDIO_BUFFER_QUEUE_SIZE) + " buffers</p>";
+        html += "</div>";
+        
+        html += "<div id='status-info'></div>";
+        html += "</div>";
+        
         html += "<script>";
-        html += "function playTone(freq) { fetch('/audio/tone?freq=' + freq); }";
-        html += "function playWhiteNoise() { fetch('/audio/noise'); }";
-        html += "function stopAudio() { fetch('/audio/stop'); }";
-        html += "function audioStatus() { fetch('/audio/status').then(r=>r.text()).then(t=>alert(t)); }";
-        html += "function audioDiagnostics() { window.open('/audio/diagnostics'); }";
-        html += "</script>";
+        html += "function startStream() {";
+        html += "  fetch('/start-stream', {method: 'POST'})";
+        html += "    .then(response => response.text())";
+        html += "    .then(data => { alert(data); setTimeout(() => location.reload(), 1000); });";
+        html += "}";
+        html += "function stopStream() {";
+        html += "  fetch('/stop-stream', {method: 'POST'})";
+        html += "    .then(response => response.text())";
+        html += "    .then(data => { alert(data); setTimeout(() => location.reload(), 1000); });";
+        html += "}";
+        html += "function getStatus() {";
+        html += "  fetch('/status')";
+        html += "    .then(response => response.json())";
+        html += "    .then(data => {";
+        html += "      document.getElementById('status-info').innerHTML = ";
+        html += "        '<div class=\"settings\"><h3>System Status</h3><pre>' + ";
+        html += "        JSON.stringify(data, null, 2) + '</pre></div>';";
+        html += "    });";
+        html += "}";
+        html += "</script></body></html>";
         
-        html += "</body></html>";
         server.send(200, "text/html", html);
     });
     
-    // Audio control endpoints
-    server.on("/audio/tone", HTTP_GET, handlePlayTone);
-    server.on("/audio/noise", HTTP_GET, handlePlayNoise);
-    server.on("/audio/stop", HTTP_GET, handleStopAudio);
-    server.on("/audio/status", HTTP_GET, handleAudioStatus);
-    server.on("/audio/diagnostics", HTTP_GET, handleAudioDiagnostics);
+    server.on("/start-stream", HTTP_POST, []() {
+        startPCMStreaming();
+        server.send(200, "text/plain", "PCM streaming started");
+    });
     
-    // Configuration pages (keep existing ones)
-    server.on("/config", HTTP_GET, handleConfigPage);
-    server.on("/config", HTTP_POST, handleConfigSave);
-    server.on("/info", HTTP_GET, handleInfoPage);
-    server.on("/reset", HTTP_GET, handleReset);
+    server.on("/stop-stream", HTTP_POST, []() {
+        stopPCMStreaming();
+        server.send(200, "text/plain", "PCM streaming stopped");
+    });
+    
+    server.on("/status", HTTP_GET, []() {
+        String json = "{";
+        json += "\"wifi_connected\":" + String(isConnected ? "true" : "false") + ",";
+        json += "\"audio_initialized\":" + String(audioInitialized ? "true" : "false") + ",";
+        json += "\"streaming_requested\":" + String(streamingRequested ? "true" : "false") + ",";
+        json += "\"streaming_active\":" + String(streamingActive ? "true" : "false") + ",";
+        json += "\"server_host\":\"" + String(PCM_SERVER_HOST) + "\",";
+        json += "\"server_port\":" + String(PCM_SERVER_PORT) + ",";
+        json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+        json += "\"queue_count\":" + String(audioBufferQueue ? uxQueueMessagesWaiting(audioBufferQueue) : 0);
+        json += "}";
+        server.send(200, "application/json", json);
+    });
+    
+    server.begin();
+    Serial.println("✅ Web server started on port 80");
+    Serial.println("Ready for PCM streaming!");
 }
 
-void handlePlayTone() {
-    if (!audioInitialized) {
-        server.send(500, "text/plain", "Audio system not initialized");
-        return;
-    }
-    
-    float frequency = 440.0f; // Default A4
-    if (server.hasArg("freq")) {
-        frequency = server.arg("freq").toFloat();
-    }
-    
-    Serial.printf("Starting continuous tone: %.1f Hz\n", frequency);
-    
-    // Start continuous tone playback
-    startContinuousTone(frequency);
-    
-    server.send(200, "text/plain", "Playing continuous tone: " + String(frequency) + " Hz");
-}
-
-void handlePlayNoise() {
-    if (!audioInitialized) {
-        server.send(500, "text/plain", "Audio system not initialized");
-        return;
-    }
-    
-    Serial.println("Starting continuous white noise");
-    
-    // Stop any current tone and start noise (using a special frequency value)
-    startContinuousTone(-1.0f); // -1 indicates white noise mode
-    
-    server.send(200, "text/plain", "Playing continuous white noise");
-}
-
-void handleStopAudio() {
-    if (!audioInitialized) {
-        server.send(500, "text/plain", "Audio system not initialized");
-        return;
-    }
-    
-    Serial.println("Stopping continuous audio");
-    stopContinuousAudio();
-    
-    server.send(200, "text/plain", "Audio stopped");
-}
-
-void handleAudioStatus() {
-    if (!audioInitialized) {
-        server.send(500, "text/plain", "Audio system not initialized");
-        return;
-    }
-    
-    String status = "Audio Status:\\n";
-    status += "Status: " + audioStreamer->getStatusString() + "\\n";
-    status += "Playing: " + String(audioPlaying ? "Yes" : "No") + "\\n";
-    status += "Buffer Utilization: " + String(audioStreamer->getBufferUtilization()) + "%\\n";
-    status += "Total Bytes Written: " + String(audioStreamer->getTotalBytesWritten()) + "\\n";
-    status += "Buffer Overflows: " + String(audioStreamer->getBufferOverflows()) + "\\n";
-    status += "Bytes Per Second: " + String(audioStreamer->getBytesPerSecond()) + "\\n";
-    
-    server.send(200, "text/plain", status);
-}
-
-void handleAudioDiagnostics() {
-    if (!audioInitialized) {
-        server.send(500, "text/plain", "Audio system not initialized");
-        return;
-    }
-    
-    String html = "<!DOCTYPE html><html><head><title>Audio Diagnostics</title>";
-    html += "<style>body{font-family:monospace;margin:20px;} pre{background:#f5f5f5;padding:10px;border-radius:5px;}</style>";
-    html += "</head><body><h1>Audio System Diagnostics</h1><pre>";
-    
-    // Capture diagnostics output
-    html += "Status: " + audioStreamer->getStatusString() + "\\n";
-    html += "Sample Rate: " + String(audioStreamer->getAudioConfig().sampleRate) + " Hz\\n";
-    html += "Bits Per Sample: " + String(audioStreamer->getAudioConfig().bitsPerSample) + "\\n";
-    html += "Channels: " + String(audioStreamer->getAudioConfig().channels) + "\\n";
-    html += "Buffer Size: " + String(audioStreamer->getAudioConfig().bufferSize) + " bytes\\n";
-    html += "Buffer Count: " + String(audioStreamer->getAudioConfig().bufferCount) + "\\n";
-    html += "\\n";
-    html += "Pin Configuration:\\n";
-    html += "BCLK Pin: " + String(audioStreamer->getPinConfig().bclkPin) + "\\n";
-    html += "LRCK Pin: " + String(audioStreamer->getPinConfig().lrckPin) + "\\n";
-    html += "Data Pin: " + String(audioStreamer->getPinConfig().dataPin) + "\\n";
-    html += "\\n";
-    html += "Statistics:\\n";
-    html += "Total Bytes Written: " + String(audioStreamer->getTotalBytesWritten()) + "\\n";
-    html += "Total Packets: " + String(audioStreamer->getTotalPacketsProcessed()) + "\\n";
-    html += "Buffer Overflows: " + String(audioStreamer->getBufferOverflows()) + "\\n";
-    html += "Buffer Utilization: " + String(audioStreamer->getBufferUtilization()) + "%\\n";
-    html += "Bytes Per Second: " + String(audioStreamer->getBytesPerSecond()) + "\\n";
-    
-    html += "</pre></body></html>";
-    
-    server.send(200, "text/html", html);
-}
-
-// Keep existing web handlers
-void handleConfigPage() {
-    // ... existing implementation from backup
-    String html = "<!DOCTYPE html><html><head><title>WiFi Configuration</title></head><body>";
-    html += "<h1>WiFi Configuration</h1>";
-    html += "<form method='POST'>";
-    html += "SSID: <input type='text' name='ssid' value='" + String(config.settings.wifiSSID) + "'><br><br>";
-    html += "Password: <input type='password' name='password' value='" + String(config.settings.wifiPassword) + "'><br><br>";
-    html += "<input type='submit' value='Save'>";
-    html += "</form>";
-    html += "<br><a href='/'>Back to Home</a>";
-    html += "</body></html>";
-    server.send(200, "text/html", html);
-}
-
-void handleConfigSave() {
-    if (server.hasArg("ssid") && server.hasArg("password")) {
-        strncpy(config.settings.wifiSSID, server.arg("ssid").c_str(), sizeof(config.settings.wifiSSID) - 1);
-        strncpy(config.settings.wifiPassword, server.arg("password").c_str(), sizeof(config.settings.wifiPassword) - 1);
-        config.save();
-        server.send(200, "text/html", "<html><body><h1>Settings Saved!</h1><a href='/'>Back to Home</a></body></html>");
-    } else {
-        server.send(400, "text/html", "<html><body><h1>Error: Missing parameters</h1><a href='/config'>Back</a></body></html>");
-    }
-}
-
-void handleInfoPage() {
-    String html = "<!DOCTYPE html><html><head><title>System Information</title></head><body>";
-    html += "<h1>System Information</h1>";
-    html += "<p><strong>Chip Model:</strong> " + String(ESP.getChipModel()) + "</p>";
-    html += "<p><strong>Free Heap:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>";
-    html += "<p><strong>Flash Size:</strong> " + String(ESP.getFlashChipSize()) + " bytes</p>";
-    html += "<p><strong>WiFi Status:</strong> " + String(WiFi.status()) + "</p>";
-    if (audioInitialized) {
-        html += "<p><strong>Audio Status:</strong> " + audioStreamer->getStatusString() + "</p>";
-    }
-    html += "<br><a href='/'>Back to Home</a>";
-    html += "</body></html>";
-    server.send(200, "text/html", html);
-}
-
-void handleReset() {
-    server.send(200, "text/html", "<html><body><h1>Resetting...</h1></body></html>");
-    delay(1000);
-    ESP.restart();
-}
-
-void printSystemStatus() {
-    Serial.println("=== System Status Report ===");
-    Serial.printf("Uptime: %lu seconds\n", millis() / 1000);
-    Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
-    Serial.printf("WiFi: %s\n", isConnected ? "Connected" : "Disconnected");
-    if (isConnected) {
-        Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
-    }
-    Serial.printf("Audio System: %s\n", audioInitialized ? "Ready" : "Failed");
-    if (audioInitialized) {
-        Serial.printf("Audio Status: %s\n", audioStreamer->getStatusString().c_str());
-        Serial.printf("Audio Playing: %s\n", audioPlaying ? "Yes" : "No");
-    }
-    Serial.println("============================");
+void loop() {
+    server.handleClient();
+    delay(10);
 }
