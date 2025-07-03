@@ -20,6 +20,11 @@ BOARD_FQBN="esp32:esp32:esp32"
 BUILD_DIR="$PWD/build"
 FIRMWARE_NAME="radiobenziger_firmware.bin"
 
+# Detect number of CPU cores for parallel compilation
+CPU_CORES=$(nproc)
+# Use all cores, but cap at 8 to avoid overwhelming the system
+PARALLEL_JOBS=$((CPU_CORES > 8 ? 8 : CPU_CORES))
+
 # Function to print colored output 
 print_status() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -58,6 +63,7 @@ if [ ! -f "$PROJECT_DIR/$SKETCH_NAME" ]; then
 fi
 
 print_status "Starting build process for Radio Benziger ESP32 project..."
+print_status "Using $PARALLEL_JOBS parallel compilation jobs (detected $CPU_CORES CPU cores)"
 
 # Create build directory
 mkdir -p "$BUILD_DIR"
@@ -85,9 +91,9 @@ print_status "Checking required libraries..."
 # Navigate to project directory
 cd "$PROJECT_DIR"
 
-# Compile the sketch
-print_status "Compiling sketch..."
-arduino-cli compile --fqbn "$BOARD_FQBN" "$SKETCH_NAME" --build-path "$BUILD_DIR" --verbose
+# Compile the sketch with parallel jobs
+print_status "Compiling sketch with $PARALLEL_JOBS parallel jobs..."
+arduino-cli compile --fqbn "$BOARD_FQBN" "$SKETCH_NAME" --build-path "$BUILD_DIR" --jobs $PARALLEL_JOBS --verbose
 
 if [ $? -eq 0 ]; then
     print_success "Compilation successful!"
