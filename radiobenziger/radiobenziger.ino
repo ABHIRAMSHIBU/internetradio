@@ -256,8 +256,19 @@ void streamingTask(void* parameter) {
                     int16_t* pcmBuffer = (int16_t*)httpBuffer;
                     
                     while (streamingRequested && stream->connected()) {
-                        // Read PCM data from HTTP stream - read multiple chunks to fill queue
+                        // Intelligent flow control - only read when queue has space
                         while (streamingRequested && stream->connected()) {
+                            // Check queue space before reading HTTP data
+                            UBaseType_t queueSpace = uxQueueSpacesAvailable(audioBufferQueue);
+                            UBaseType_t queueCount = uxQueueMessagesWaiting(audioBufferQueue);
+                            
+                            // Only read if we have space for at least 2 buffers
+                            if (queueSpace < 2) {
+                                // Queue nearly full, wait for consumption
+                                vTaskDelay(pdMS_TO_TICKS(10));
+                                continue;
+                            }
+                            
                             int bytesRead = stream->readBytes(httpBuffer, HTTP_BUFFER_SIZE);
                             
                             if (bytesRead > 0) {
@@ -281,21 +292,7 @@ void streamingTask(void* parameter) {
                                     
                                     // Send to audio playback queue
                                     if (audioBufferQueue != nullptr) {
-                                        // Check queue space
-                                        UBaseType_t queueSpace = uxQueueSpacesAvailable(audioBufferQueue);
-                                        
-                                        if (queueSpace == 0) {
-                                            // Queue full, remove oldest buffer and add new one
-                                            AudioBuffer oldBuffer;
-                                            xQueueReceive(audioBufferQueue, &oldBuffer, 0);
-                                            static uint32_t dropCount = 0;
-                                            dropCount++;
-                                            if (dropCount % 20 == 0) {
-                                                Serial.printf("Buffer overflow: dropped %u buffers\n", dropCount);
-                                            }
-                                        }
-                                        
-                                        // Add new buffer
+                                        // Add buffer (we already checked space above)
                                         if (xQueueSend(audioBufferQueue, &buffer, pdMS_TO_TICKS(10)) != pdTRUE) {
                                             Serial.println("Failed to queue audio buffer");
                                         }
@@ -304,17 +301,12 @@ void streamingTask(void* parameter) {
                                     offset += chunkSize;
                                 }
                                 
-                                // Check if we should fill the queue more aggressively
-                                UBaseType_t queueCount = uxQueueMessagesWaiting(audioBufferQueue);
-                                if (queueCount < 2) {
-                                    // Queue is low, continue reading without delay
+                                // Adaptive flow control based on queue level
+                                if (queueCount < 5) {
+                                    // Queue has space, continue reading more data
                                     continue;
-                                } else if (queueCount >= 6) {
-                                    // Queue is getting full, slow down
-                                    vTaskDelay(pdMS_TO_TICKS(20));
-                                    break;
                                 } else {
-                                    // Normal level, small delay
+                                    // Queue getting full, let it drain a bit
                                     vTaskDelay(pdMS_TO_TICKS(5));
                                     break;
                                 }
