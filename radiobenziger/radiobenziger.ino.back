@@ -1,0 +1,129 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include "Config.h"
+#include "WiFiManager.h"
+
+// Global objects
+Config config;
+WiFiManager wifiManager;
+WebServer server(80);
+HTTPClient httpClient;
+WiFiClient wifiClient;
+
+// Connection state
+bool isConnected = false;
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Radio Benziger Configuration System");
+    
+    // Initialize configuration
+    config.begin();
+    
+    // Initialize WiFi
+    wifiManager.begin();
+    
+    if (config.hasWiFiCredentials()) {
+        Serial.println("Connecting to WiFi...");
+        WiFiManager::connectToWiFi(config.settings.wifiSSID, config.settings.wifiPassword);
+        
+        // Wait for connection
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\nWiFi connected!");
+            Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+            isConnected = true;
+            
+            // Start web server
+            setupWebServer();
+            server.begin();
+            Serial.println("Web server started");
+        } else {
+            Serial.println("\nWiFi connection failed!");
+        }
+    } else {
+        Serial.println("No WiFi credentials configured");
+    }
+    
+    printStatus();
+}
+
+void setupWebServer() {
+    server.on("/", handleRoot);
+    server.on("/status", handleStatus);
+    server.onNotFound(handleNotFound);
+}
+
+void handleRoot() {
+    String html = "<!DOCTYPE html><html><head><title>Radio Benziger</title>";
+    html += "<style>body{font-family:Arial;margin:40px;background:#f0f0f0;}";
+    html += ".container{max-width:600px;margin:0 auto;background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
+    html += "h1{color:#333;text-align:center;margin-bottom:30px;}";
+    html += ".status{background:#f8f9fa;padding:15px;border-radius:5px;margin:20px 0;}";
+    html += ".info{background:#e7f3ff;padding:15px;border-radius:5px;margin:20px 0;border-left:4px solid #007bff;}";
+    html += "</style></head><body>";
+    html += "<div class='container'>";
+    html += "<h1>🎵 Radio Benziger</h1>";
+    html += "<div class='status' id='status'>Loading...</div>";
+    html += "<div class='info'>Configuration system ready. Audio functionality will be added in future updates.</div>";
+    html += "<script>";
+    html += "function updateStatus(){fetch('/status').then(r=>r.json()).then(d=>{document.getElementById('status').innerHTML='Connected: '+d.connected+'<br>Stream URL: '+d.url+'<br>Device Name: '+d.deviceName;});}";
+    html += "updateStatus();setInterval(updateStatus,5000);";
+    html += "</script></div></body></html>";
+    
+    server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+    String json = "{";
+    json += "\"connected\":" + String(isConnected ? "true" : "false") + ",";
+    json += "\"url\":\"" + String(config.settings.streamURL) + "\",";
+    json += "\"deviceName\":\"" + String(config.settings.deviceName) + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+void handleNotFound() {
+    server.send(404, "text/plain", "Not found");
+}
+
+void loop() {
+    server.handleClient();
+    
+    // Handle WiFi reconnection
+    if (WiFi.status() != WL_CONNECTED && config.hasWiFiCredentials()) {
+        if (isConnected) {
+            Serial.println("WiFi disconnected, attempting reconnection...");
+            isConnected = false;
+        }
+        WiFiManager::connectToWiFi(config.settings.wifiSSID, config.settings.wifiPassword);
+        if (WiFi.status() == WL_CONNECTED && !isConnected) {
+            Serial.println("WiFi reconnected!");
+            isConnected = true;
+        }
+    }
+    
+    delay(10); // Small delay to prevent watchdog issues
+}
+
+void printStatus() {
+    Serial.println("===================================");
+    Serial.println("=== Radio Benziger Status ===");
+    Serial.printf("  Connected: %s\n", isConnected ? "Yes" : "No");
+    Serial.printf("  Stream URL: %s\n", config.settings.streamURL);
+    Serial.printf("  Device Name: %s\n", config.settings.deviceName);
+    Serial.printf("  Free Heap: %d bytes\n", ESP.getFreeHeap());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("  WiFi: %s (%s)\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("  WiFi: Disconnected");
+    }
+    Serial.println("===================================");
+}
